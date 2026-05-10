@@ -2,12 +2,14 @@
 /CLAUDE.md
 /AGENTS.md
 /config.json
+/config/
 /credentials.json
 /.idea
 /test.json
 /admin-ui/node_modules/
 /admin-ui/dist/
 /admin-ui/tsconfig.tsbuildinfo
+/admin-ui/package-lock.json
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json

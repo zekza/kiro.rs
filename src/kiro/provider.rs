@@ -15,6 +15,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::cooldown::CooldownReason;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -24,6 +25,12 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+
+/// Kiro API 调用结果，携带实际使用的凭据 ID。
+pub struct ProviderResponse {
+    pub response: reqwest::Response,
+    pub credential_id: u64,
+}
 
 /// Kiro API Provider
 ///
@@ -111,12 +118,30 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
+    #[allow(dead_code)]
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+        Ok(self.call_api_with_retry(request_body, false).await?.response)
     }
 
     /// 发送流式 API 请求
+    #[allow(dead_code)]
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+        Ok(self.call_api_with_retry(request_body, true).await?.response)
+    }
+
+    /// 发送非流式 API 请求，并返回实际使用的凭据 ID。
+    pub async fn call_api_with_context(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<ProviderResponse> {
+        self.call_api_with_retry(request_body, false).await
+    }
+
+    /// 发送流式 API 请求，并返回实际使用的凭据 ID。
+    pub async fn call_api_stream_with_context(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<ProviderResponse> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -280,7 +305,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<ProviderResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -289,10 +314,15 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let affinity_key = Self::extract_affinity_key_from_request(request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_with_affinity(model.as_deref(), affinity_key)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -354,7 +384,10 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(ProviderResponse {
+                    response,
+                    credential_id: ctx.id,
+                });
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -450,6 +483,12 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                let reason = if status.as_u16() == 429 {
+                    CooldownReason::RateLimitExceeded
+                } else {
+                    CooldownReason::ServerError
+                };
+                self.token_manager.report_temporary_cooldown(ctx.id, reason);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -504,6 +543,21 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    fn extract_affinity_key_from_request(request_body: &str) -> Option<u64> {
+        use sha2::{Digest, Sha256};
+
+        let json: serde_json::Value = serde_json::from_str(request_body).ok()?;
+        let conversation_id = json
+            .get("conversationState")?
+            .get("conversationId")?
+            .as_str()?;
+        if conversation_id.is_empty() {
+            return None;
+        }
+        let hash: [u8; 32] = Sha256::digest(conversation_id.as_bytes()).into();
+        Some(u64::from_be_bytes(hash[..8].try_into().ok()?))
     }
 
     fn retry_delay(attempt: usize) -> Duration {

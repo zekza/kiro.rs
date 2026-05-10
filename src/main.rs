@@ -17,6 +17,7 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
@@ -158,10 +159,21 @@ async fn main() {
     });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
+    let cache_tracker = if config.prompt_cache_accounting_enabled {
+        Some(Arc::new(anthropic::cache_tracker::CacheTracker::new(
+            Duration::from_secs(config.prompt_cache_ttl_seconds.max(300)),
+            anthropic::cache_tracker::CacheScope::parse(&config.cache_scope),
+            config.cache_skip_rate,
+        )))
+    } else {
+        None
+    };
+
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        cache_tracker,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

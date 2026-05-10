@@ -3,6 +3,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// === 缓存控制 ===
+
+/// Anthropic prompt cache 控制字段
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
 // === 错误响应 ===
 
 /// API 错误响应
@@ -64,7 +75,7 @@ pub struct ModelsResponse {
 const MAX_BUDGET_TOKENS: i32 = 24576;
 
 /// Thinking 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
@@ -94,7 +105,7 @@ where
 }
 
 /// OutputConfig 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
@@ -112,7 +123,7 @@ pub struct Metadata {
 }
 
 /// Messages 请求体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
@@ -150,7 +161,9 @@ where
             E: serde::de::Error,
         {
             Ok(Some(vec![SystemMessage {
+                block_type: None,
                 text: value.to_string(),
+                cache_control: None,
             }]))
         }
 
@@ -198,7 +211,11 @@ pub struct Message {
 /// 系统消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub block_type: Option<String>,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 工具定义
@@ -223,6 +240,9 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// 缓存控制
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 内容块

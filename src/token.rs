@@ -14,6 +14,8 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
 
+const TOKENS_PER_TOOL: u64 = 150;
+
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
 pub struct CountTokensConfig {
@@ -242,4 +244,45 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     }
 
     total.max(1)
+}
+
+/// 计算系统消息的 tokens
+pub(crate) fn count_system_message_tokens(message: &SystemMessage) -> u64 {
+    count_tokens(&message.text)
+}
+
+/// 计算工具定义的 tokens
+pub(crate) fn count_tool_definition_tokens(tool: &Tool) -> u64 {
+    if tool.name.is_empty() && tool.description.is_empty() && tool.input_schema.is_empty() {
+        return TOKENS_PER_TOOL;
+    }
+
+    count_tokens(&tool.name)
+        + count_tokens(&tool.description)
+        + count_tokens(&serde_json::to_string(&tool.input_schema).unwrap_or_default())
+}
+
+/// 计算消息内容块的 tokens
+pub(crate) fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::Null => 0,
+        serde_json::Value::String(s) => count_tokens(s),
+        serde_json::Value::Array(arr) => arr.iter().map(count_message_content_tokens).sum(),
+        serde_json::Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                return count_tokens(text);
+            }
+            if let Some(thinking) = obj.get("thinking").and_then(|v| v.as_str()) {
+                return count_tokens(thinking);
+            }
+            if let Some(input) = obj.get("input") {
+                return count_tokens(&serde_json::to_string(input).unwrap_or_default());
+            }
+            if let Some(content) = obj.get("content") {
+                return count_message_content_tokens(content);
+            }
+            0
+        }
+        _ => 0,
+    }
 }

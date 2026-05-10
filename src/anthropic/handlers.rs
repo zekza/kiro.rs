@@ -26,6 +26,7 @@ use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+use super::cache_tracker::CacheResult;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -65,6 +66,43 @@ fn map_provider_error(err: Error) -> Response {
         )),
     )
         .into_response()
+}
+
+fn compute_cache_result(
+    tracker: Option<&super::cache_tracker::CacheTracker>,
+    profile: Option<&super::cache_tracker::CacheProfile>,
+    credential_id: u64,
+) -> CacheResult {
+    match (tracker, profile) {
+        (Some(tracker), Some(profile)) => tracker.compute_and_update(credential_id, profile),
+        _ => CacheResult {
+            uncached_input_tokens: 0,
+            ..Default::default()
+        },
+    }
+}
+
+fn usage_input_tokens(estimated_input_tokens: i32, cache_result: CacheResult) -> i32 {
+    if cache_result.cache_read_input_tokens > 0 || cache_result.cache_creation_input_tokens > 0 {
+        cache_result.uncached_input_tokens.max(0)
+    } else {
+        estimated_input_tokens
+    }
+}
+
+fn usage_input_tokens_from_context(
+    context_input_tokens: Option<i32>,
+    estimated_input_tokens: i32,
+    cache_result: CacheResult,
+) -> i32 {
+    let base = context_input_tokens.unwrap_or(estimated_input_tokens);
+    if cache_result.cache_read_input_tokens > 0 || cache_result.cache_creation_input_tokens > 0 {
+        base.saturating_sub(cache_result.cache_read_input_tokens)
+            .saturating_sub(cache_result.cache_creation_input_tokens)
+            .max(0)
+    } else {
+        base
+    }
 }
 
 /// GET /v1/models
@@ -267,10 +305,14 @@ pub async fn post_messages(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+    let cache_profile = state
+        .cache_tracker
+        .as_ref()
+        .map(|tracker| tracker.build_profile(&payload, input_tokens));
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -288,6 +330,8 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_profile,
+            state.cache_tracker.clone(),
             thinking_enabled,
             tool_name_map,
         )
@@ -295,7 +339,7 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, cache_profile, state.cache_tracker.clone(), extract_thinking, tool_name_map).await
     }
 }
 
@@ -305,17 +349,25 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_profile: Option<super::cache_tracker::CacheProfile>,
+    cache_tracker: Option<std::sync::Arc<super::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let provider_response = match provider.call_api_stream_with_context(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let response = provider_response.response;
+    let cache_result = compute_cache_result(
+        cache_tracker.as_deref(),
+        cache_profile.as_ref(),
+        provider_response.credential_id,
+    );
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_thinking(model, usage_input_tokens(input_tokens, cache_result), thinking_enabled, tool_name_map, cache_result);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -441,14 +493,22 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_profile: Option<super::cache_tracker::CacheProfile>,
+    cache_tracker: Option<std::sync::Arc<super::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let provider_response = match provider.call_api_with_context(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let response = provider_response.response;
+    let cache_result = compute_cache_result(
+        cache_tracker.as_deref(),
+        cache_profile.as_ref(),
+        provider_response.credential_id,
+    );
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -600,7 +660,8 @@ async fn handle_non_stream_request(
     let output_tokens = token::estimate_output_tokens(&content);
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    let final_input_tokens =
+        usage_input_tokens_from_context(context_input_tokens, input_tokens, cache_result);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -613,7 +674,13 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": {
             "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_result.cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_result.cache_read_input_tokens,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": cache_result.cache_creation_5m_input_tokens,
+                "ephemeral_1h_input_tokens": cache_result.cache_creation_1h_input_tokens
+            }
         }
     });
 
@@ -780,10 +847,14 @@ pub async fn post_messages_cc(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+    let cache_profile = state
+        .cache_tracker
+        .as_ref()
+        .map(|tracker| tracker.build_profile(&payload, input_tokens));
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -801,6 +872,8 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_profile,
+            state.cache_tracker.clone(),
             thinking_enabled,
             tool_name_map,
         )
@@ -808,7 +881,7 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, cache_profile, state.cache_tracker.clone(), extract_thinking, tool_name_map).await
     }
 }
 
@@ -821,17 +894,25 @@ async fn handle_stream_request_buffered(
     request_body: &str,
     model: &str,
     estimated_input_tokens: i32,
+    cache_profile: Option<super::cache_tracker::CacheProfile>,
+    cache_tracker: Option<std::sync::Arc<super::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let provider_response = match provider.call_api_stream_with_context(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let response = provider_response.response;
+    let cache_result = compute_cache_result(
+        cache_tracker.as_deref(),
+        cache_profile.as_ref(),
+        provider_response.credential_id,
+    );
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(model, usage_input_tokens(estimated_input_tokens, cache_result), thinking_enabled, tool_name_map, cache_result);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

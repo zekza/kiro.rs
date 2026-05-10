@@ -6,10 +6,12 @@ use axum::{
     middleware,
     routing::{get, post},
 };
+use std::sync::Arc;
 
 use crate::kiro::provider::KiroProvider;
 
 use super::{
+    cache_tracker::CacheTracker,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
 };
@@ -38,8 +40,9 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    cache_tracker: Option<Arc<CacheTracker>>,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(api_key, extract_thinking, cache_tracker);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

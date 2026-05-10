@@ -13,6 +13,7 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
 
 /// 应用共享状态
@@ -25,15 +26,22 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 本地 prompt cache usage 追踪器
+    pub cache_tracker: Option<Arc<CacheTracker>>,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        cache_tracker: Option<Arc<CacheTracker>>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            cache_tracker,
         }
     }
 

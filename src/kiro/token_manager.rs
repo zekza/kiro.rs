@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::affinity::UserAffinityManager;
+use crate::kiro::cooldown::{CooldownManager, CooldownReason};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -526,6 +528,10 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 凭据临时冷却状态
+    cooldown_manager: CooldownManager,
+    /// 用户亲和绑定
+    affinity_manager: UserAffinityManager,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -655,6 +661,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            cooldown_manager: CooldownManager::new(),
+            affinity_manager: UserAffinityManager::new(),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -694,7 +702,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        affinity_key: Option<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -715,6 +727,24 @@ impl MultiTokenManager {
                 }
                 true
             })
+            .collect();
+
+        if available.is_empty() {
+            return None;
+        }
+
+        if let Some(key) = affinity_key
+            && let Some(bound_id) = self.affinity_manager.get(key)
+            && let Some(entry) = available
+                .iter()
+                .find(|e| e.id == bound_id && self.cooldown_manager.is_available(e.id))
+        {
+            return Some((entry.id, entry.credentials.clone()));
+        }
+
+        let available: Vec<_> = available
+            .into_iter()
+            .filter(|e| self.cooldown_manager.is_available(e.id))
             .collect();
 
         if available.is_empty() {
@@ -753,6 +783,15 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_affinity(model, None).await
+    }
+
+    /// 获取 API 调用上下文，并尽量保持同一用户落到同一凭据。
+    pub async fn acquire_context_with_affinity(
+        &self,
+        model: Option<&str>,
+        affinity_key: Option<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -778,7 +817,11 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id
+                                && !e.disabled
+                                && self.cooldown_manager.is_available(e.id)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
@@ -786,7 +829,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, affinity_key);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -805,7 +848,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, affinity_key);
                         }
                     }
 
@@ -828,6 +871,9 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    if let Some(key) = affinity_key {
+                        self.affinity_manager.set(key, ctx.id);
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -838,6 +884,8 @@ impl MultiTokenManager {
                             self.report_refresh_token_invalid(id)
                         } else {
                             tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                            self.cooldown_manager
+                                .set(id, CooldownReason::TokenRefreshFailed);
                             self.report_refresh_failure(id)
                         };
                     attempt_count += 1;
@@ -1125,6 +1173,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
+        self.cooldown_manager.clear(id);
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1150,6 +1199,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
+        self.affinity_manager.remove_by_credential(id);
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1209,6 +1259,7 @@ impl MultiTokenManager {
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
+        self.affinity_manager.remove_by_credential(id);
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1257,6 +1308,7 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
+        self.affinity_manager.remove_by_credential(id);
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1320,6 +1372,7 @@ impl MultiTokenManager {
     /// 立即禁用凭据，不累计、不重试。
     /// 返回是否还有可用凭据。
     pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
+        self.affinity_manager.remove_by_credential(id);
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1361,6 +1414,15 @@ impl MultiTokenManager {
         };
         self.save_stats_debounced();
         result
+    }
+
+    /// 对临时上游错误设置短冷却，不永久禁用凭据。
+    pub fn report_temporary_cooldown(&self, id: u64, reason: CooldownReason) -> bool {
+        self.cooldown_manager.set(id, reason);
+        self.entries
+            .lock()
+            .iter()
+            .any(|e| !e.disabled && self.cooldown_manager.is_available(e.id))
     }
 
     /// 切换到优先级最高的可用凭据

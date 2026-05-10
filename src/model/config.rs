@@ -98,6 +98,23 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 是否启用本地 prompt cache usage 模拟
+    #[serde(default = "default_prompt_cache_accounting_enabled")]
+    pub prompt_cache_accounting_enabled: bool,
+
+    /// prompt cache 最大 TTL 秒数（默认 3600，支持 5m/1h usage 统计）
+    #[serde(default = "default_prompt_cache_ttl_seconds")]
+    pub prompt_cache_ttl_seconds: u64,
+
+    /// cache 分桶范围："global" 或 "perCredential"
+    #[serde(default = "default_cache_scope")]
+    pub cache_scope: String,
+
+    /// cache 命中跳过率（0.0-1.0），用于降低可观察命中率
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_skip_rate: Option<f32>,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -155,6 +172,18 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_prompt_cache_accounting_enabled() -> bool {
+    true
+}
+
+fn default_prompt_cache_ttl_seconds() -> u64 {
+    3600
+}
+
+fn default_cache_scope() -> String {
+    "global".to_string()
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -182,6 +211,10 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            prompt_cache_accounting_enabled: default_prompt_cache_accounting_enabled(),
+            prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
+            cache_scope: default_cache_scope(),
+            cache_skip_rate: None,
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
