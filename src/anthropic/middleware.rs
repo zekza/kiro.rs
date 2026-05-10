@@ -13,6 +13,7 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::call_log::CallLogger;
 use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
 
@@ -28,6 +29,8 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 本地 prompt cache usage 追踪器
     pub cache_tracker: Option<Arc<CacheTracker>>,
+    /// 轻量调用记录器
+    pub call_logger: Option<Arc<CallLogger>>,
 }
 
 impl AppState {
@@ -36,12 +39,14 @@ impl AppState {
         api_key: impl Into<String>,
         extract_thinking: bool,
         cache_tracker: Option<Arc<CacheTracker>>,
+        call_logger: Option<Arc<CallLogger>>,
     ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
             cache_tracker,
+            call_logger,
         }
     }
 

@@ -115,6 +115,19 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_skip_rate: Option<f32>,
 
+    /// 是否启用轻量调用记录（JSONL，仅记录截断和脱敏后的请求/响应体）
+    #[serde(default = "default_call_logging_enabled")]
+    pub call_logging_enabled: bool,
+
+    /// 调用记录文件路径，未配置时写到凭据文件同目录的 kiro_call_log.jsonl
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_log_path: Option<String>,
+
+    /// 调用记录中请求/响应体最大截断字节数
+    #[serde(default = "default_call_log_body_bytes")]
+    pub call_log_body_bytes: usize,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -184,6 +197,14 @@ fn default_cache_scope() -> String {
     "global".to_string()
 }
 
+fn default_call_logging_enabled() -> bool {
+    true
+}
+
+fn default_call_log_body_bytes() -> usize {
+    4096
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -215,6 +236,9 @@ impl Default for Config {
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             cache_scope: default_cache_scope(),
             cache_skip_rate: None,
+            call_logging_enabled: default_call_logging_enabled(),
+            call_log_path: None,
+            call_log_body_bytes: default_call_log_body_bytes(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,

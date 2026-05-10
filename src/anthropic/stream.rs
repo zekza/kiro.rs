@@ -1256,6 +1256,14 @@ impl BufferedStreamContext {
 
         std::mem::take(&mut self.event_buffer)
     }
+
+    pub fn output_tokens(&self) -> i32 {
+        self.inner.output_tokens
+    }
+
+    pub fn cache_result(&self) -> CacheResult {
+        self.inner.cache_result
+    }
 }
 
 /// 简单的 token 估算

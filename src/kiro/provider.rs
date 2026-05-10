@@ -17,6 +17,7 @@ use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::cooldown::CooldownReason;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::common::utf8::truncate_with_ellipsis;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -25,6 +26,7 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+const MAX_UPSTREAM_BODY_LOG_BYTES: usize = 4096;
 
 /// Kiro API 调用结果，携带实际使用的凭据 ID。
 pub struct ProviderResponse {
@@ -225,20 +227,21 @@ impl KiroProvider {
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+            let body_summary = truncate_with_ellipsis(&body, MAX_UPSTREAM_BODY_LOG_BYTES);
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body_summary);
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body_summary));
                 continue;
             }
 
             // 400 Bad Request
             if status.as_u16() == 400 {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!("MCP 请求失败: {} {}", status, body_summary);
             }
 
             // 401/403 凭据问题
@@ -256,9 +259,9 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body_summary);
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body_summary));
                 continue;
             }
 
@@ -269,9 +272,22 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries,
                     status,
-                    body
+                    body_summary
                 );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                let reason = if status.as_u16() == 429 {
+                    CooldownReason::RateLimitExceeded
+                } else {
+                    CooldownReason::ServerError
+                };
+                let has_available = self.token_manager.report_temporary_cooldown(ctx.id, reason);
+                if !has_available {
+                    anyhow::bail!(
+                        "MCP 请求失败（所有凭据冷却中）: {} {}",
+                        status,
+                        body_summary
+                    );
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body_summary));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -280,11 +296,11 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!("MCP 请求失败: {} {}", status, body_summary);
             }
 
             // 兜底
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body_summary));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -392,6 +408,7 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+            let body_summary = truncate_with_ellipsis(&body, MAX_UPSTREAM_BODY_LOG_BYTES);
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -400,7 +417,7 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries,
                     status,
-                    body
+                    body_summary
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
@@ -409,7 +426,7 @@ impl KiroProvider {
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
                         api_type,
                         status,
-                        body
+                        body_summary
                     );
                 }
 
@@ -417,14 +434,14 @@ impl KiroProvider {
                     "{} API 请求失败: {} {}",
                     api_type,
                     status,
-                    body
+                    body_summary
                 ));
                 continue;
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body_summary);
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -434,7 +451,7 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries,
                     status,
-                    body
+                    body_summary
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
@@ -454,7 +471,7 @@ impl KiroProvider {
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
                         api_type,
                         status,
-                        body
+                        body_summary
                     );
                 }
 
@@ -462,7 +479,7 @@ impl KiroProvider {
                     "{} API 请求失败: {} {}",
                     api_type,
                     status,
-                    body
+                    body_summary
                 ));
                 continue;
             }
@@ -475,20 +492,28 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries,
                     status,
-                    body
+                    body_summary
                 );
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
                     status,
-                    body
+                    body_summary
                 ));
                 let reason = if status.as_u16() == 429 {
                     CooldownReason::RateLimitExceeded
                 } else {
                     CooldownReason::ServerError
                 };
-                self.token_manager.report_temporary_cooldown(ctx.id, reason);
+                let has_available = self.token_manager.report_temporary_cooldown(ctx.id, reason);
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据冷却中）: {} {}",
+                        api_type,
+                        status,
+                        body_summary
+                    );
+                }
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -497,7 +522,7 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body_summary);
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -506,13 +531,13 @@ impl KiroProvider {
                 attempt + 1,
                 max_retries,
                 status,
-                body
+                body_summary
             );
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
                 api_type,
                 status,
-                body
+                body_summary
             ));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;

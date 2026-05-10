@@ -24,6 +24,7 @@
 
 mod converter;
 pub(crate) mod cache_tracker;
+pub(crate) mod call_log;
 mod handlers;
 mod middleware;
 mod router;

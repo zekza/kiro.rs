@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 
 use anyhow::Error;
+use std::sync::Arc;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -18,9 +19,11 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::time::interval;
 use uuid::Uuid;
 
+use super::call_log::{CallLogRecord, CallLogger};
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -31,12 +34,13 @@ use super::cache_tracker::CacheResult;
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
+    let err_summary = crate::common::utf8::truncate_with_ellipsis(&err_str, 4096);
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        tracing::warn!(error = %err_summary, "上游拒绝请求：上下文窗口已满（不应重试）");
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::PAYLOAD_TOO_LARGE,
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 "Context window is full. Reduce conversation history, system prompt, or tools.",
@@ -47,9 +51,9 @@ fn map_provider_error(err: Error) -> Response {
 
     // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+        tracing::warn!(error = %err_summary, "上游拒绝请求：输入过长（不应重试）");
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::PAYLOAD_TOO_LARGE,
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 "Input is too long. Reduce the size of your messages.",
@@ -57,12 +61,49 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
-    tracing::error!("Kiro API 调用失败: {}", err);
+
+    if err_str.contains("所有凭据均已禁用") || err_str.contains("所有凭据均无法获取有效 Token") {
+        tracing::warn!(error = %err_summary, "当前无可用 Kiro 凭据");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "No Kiro credential is currently available. Retry after cooldown or check credentials.",
+            )),
+        )
+            .into_response();
+    }
+
+    if err_str.contains("429") || err_str.contains("RateLimit") || err_str.contains("rate limit") {
+        tracing::warn!(error = %err_summary, "上游或本地凭据触发限流");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Kiro upstream is rate limited or all matching credentials are cooling down. Retry later.",
+            )),
+        )
+            .into_response();
+    }
+
+    if err_str.contains("400 Bad Request") || err_str.contains("Improperly formed request") {
+        tracing::warn!(error = %err_summary, "上游拒绝请求格式");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs.",
+            )),
+        )
+            .into_response();
+    }
+
+    tracing::error!("Kiro API 调用失败: {}", err_summary);
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            format!("上游 API 调用失败: {}", err),
+            "上游 API 调用失败，请稍后重试。",
         )),
     )
         .into_response()
@@ -102,6 +143,66 @@ fn usage_input_tokens_from_context(
             .max(0)
     } else {
         base
+    }
+}
+
+struct CallLogContext {
+    logger: Option<Arc<CallLogger>>,
+    route: &'static str,
+    model: String,
+    stream: bool,
+    request_body: String,
+    input_tokens: i32,
+    started_at: Instant,
+}
+
+impl CallLogContext {
+    fn new(
+        logger: Option<Arc<CallLogger>>,
+        route: &'static str,
+        model: &str,
+        stream: bool,
+        request_body: &str,
+        input_tokens: i32,
+    ) -> Self {
+        Self {
+            logger,
+            route,
+            model: model.to_string(),
+            stream,
+            request_body: request_body.to_string(),
+            input_tokens,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn record(
+        &self,
+        status: &'static str,
+        credential_id: Option<u64>,
+        output_tokens: Option<i32>,
+        cache: CacheResult,
+        response_body: Option<String>,
+        error: Option<String>,
+    ) {
+        let Some(logger) = &self.logger else {
+            return;
+        };
+        logger.record(CallLogRecord {
+            route: self.route,
+            model: self.model.clone(),
+            stream: self.stream,
+            credential_id,
+            status,
+            http_status: None,
+            duration_ms: self.started_at.elapsed().as_millis(),
+            input_tokens: self.input_tokens,
+            output_tokens,
+            cache,
+            request_body: Some(self.request_body.clone()),
+            response_body,
+            error,
+        });
     }
 }
 
@@ -332,6 +433,8 @@ pub async fn post_messages(
             input_tokens,
             cache_profile,
             state.cache_tracker.clone(),
+            state.call_logger.clone(),
+            "/v1/messages",
             thinking_enabled,
             tool_name_map,
         )
@@ -339,7 +442,19 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, cache_profile, state.cache_tracker.clone(), extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            cache_profile,
+            state.cache_tracker.clone(),
+            state.call_logger.clone(),
+            "/v1/messages",
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -351,13 +466,20 @@ async fn handle_stream_request(
     input_tokens: i32,
     cache_profile: Option<super::cache_tracker::CacheProfile>,
     cache_tracker: Option<std::sync::Arc<super::cache_tracker::CacheTracker>>,
+    call_logger: Option<Arc<CallLogger>>,
+    route: &'static str,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
+    let log_ctx = CallLogContext::new(call_logger, route, model, true, request_body, input_tokens);
     // 调用 Kiro API（支持多凭据故障转移）
     let provider_response = match provider.call_api_stream_with_context(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let error = e.to_string();
+            log_ctx.record("error", None, None, CacheResult::default(), None, Some(error.clone()));
+            return map_provider_error(e);
+        }
     };
     let response = provider_response.response;
     let cache_result = compute_cache_result(
@@ -373,7 +495,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, log_ctx, provider_response.credential_id);
 
     // 返回 SSE 响应
     Response::builder()
@@ -398,6 +520,8 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    log_ctx: CallLogContext,
+    credential_id: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -410,8 +534,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), log_ctx, credential_id),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, log_ctx, credential_id)| async move {
             if finished {
                 return None;
             }
@@ -448,26 +572,47 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, log_ctx, credential_id)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            let error = e.to_string();
+                            tracing::error!("读取响应流失败: {}", error);
                             // 发送最终事件并结束
+                            let output_tokens = ctx.output_tokens;
+                            let cache_result = ctx.cache_result;
                             let final_events = ctx.generate_final_events();
+                            log_ctx.record(
+                                "stream_error",
+                                Some(credential_id),
+                                Some(output_tokens),
+                                cache_result,
+                                None,
+                                Some(error),
+                            );
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, log_ctx, credential_id)))
                         }
                         None => {
                             // 流结束，发送最终事件
+                            let output_tokens = ctx.output_tokens;
+                            let cache_result = ctx.cache_result;
                             let final_events = ctx.generate_final_events();
+                            log_ctx.record(
+                                "ok",
+                                Some(credential_id),
+                                Some(output_tokens),
+                                cache_result,
+                                None,
+                                None,
+                            );
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, log_ctx, credential_id)))
                         }
                     }
                 }
@@ -475,7 +620,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, log_ctx, credential_id)))
                 }
             }
         },
@@ -495,13 +640,20 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     cache_profile: Option<super::cache_tracker::CacheProfile>,
     cache_tracker: Option<std::sync::Arc<super::cache_tracker::CacheTracker>>,
+    call_logger: Option<Arc<CallLogger>>,
+    route: &'static str,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
+    let log_ctx = CallLogContext::new(call_logger, route, model, false, request_body, input_tokens);
     // 调用 Kiro API（支持多凭据故障转移）
     let provider_response = match provider.call_api_with_context(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let error = e.to_string();
+            log_ctx.record("error", None, None, CacheResult::default(), None, Some(error.clone()));
+            return map_provider_error(e);
+        }
     };
     let response = provider_response.response;
     let cache_result = compute_cache_result(
@@ -514,7 +666,16 @@ async fn handle_non_stream_request(
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
+            let error = e.to_string();
+            tracing::error!("读取响应体失败: {}", error);
+            log_ctx.record(
+                "read_error",
+                Some(provider_response.credential_id),
+                None,
+                cache_result,
+                None,
+                Some(error.clone()),
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -525,6 +686,7 @@ async fn handle_non_stream_request(
                 .into_response();
         }
     };
+    let response_body_excerpt = String::from_utf8_lossy(&body_bytes).to_string();
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
@@ -683,6 +845,14 @@ async fn handle_non_stream_request(
             }
         }
     });
+    log_ctx.record(
+        "ok",
+        Some(provider_response.credential_id),
+        Some(output_tokens),
+        cache_result,
+        Some(response_body_excerpt),
+        None,
+    );
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
@@ -874,6 +1044,8 @@ pub async fn post_messages_cc(
             input_tokens,
             cache_profile,
             state.cache_tracker.clone(),
+            state.call_logger.clone(),
+            "/cc/v1/messages",
             thinking_enabled,
             tool_name_map,
         )
@@ -881,7 +1053,19 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, cache_profile, state.cache_tracker.clone(), extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            cache_profile,
+            state.cache_tracker.clone(),
+            state.call_logger.clone(),
+            "/cc/v1/messages",
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -896,13 +1080,27 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     cache_profile: Option<super::cache_tracker::CacheProfile>,
     cache_tracker: Option<std::sync::Arc<super::cache_tracker::CacheTracker>>,
+    call_logger: Option<Arc<CallLogger>>,
+    route: &'static str,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
+    let log_ctx = CallLogContext::new(
+        call_logger,
+        route,
+        model,
+        true,
+        request_body,
+        estimated_input_tokens,
+    );
     // 调用 Kiro API（支持多凭据故障转移）
     let provider_response = match provider.call_api_stream_with_context(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let error = e.to_string();
+            log_ctx.record("error", None, None, CacheResult::default(), None, Some(error.clone()));
+            return map_provider_error(e);
+        }
     };
     let response = provider_response.response;
     let cache_result = compute_cache_result(
@@ -915,7 +1113,7 @@ async fn handle_stream_request_buffered(
     let ctx = BufferedStreamContext::new(model, usage_input_tokens(estimated_input_tokens, cache_result), thinking_enabled, tool_name_map, cache_result);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, log_ctx, provider_response.credential_id);
 
     // 返回 SSE 响应
     Response::builder()
@@ -937,6 +1135,8 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    log_ctx: CallLogContext,
+    credential_id: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -947,8 +1147,10 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            log_ctx,
+            credential_id,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, log_ctx, credential_id)| async move {
             if finished {
                 return None;
             }
@@ -963,7 +1165,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, log_ctx, credential_id)));
                     }
 
                     // 然后处理数据流
@@ -991,23 +1193,44 @@ fn create_buffered_sse_stream(
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
+                                let error = e.to_string();
+                                tracing::error!("读取响应流失败: {}", error);
                                 // 发生错误，完成处理并返回所有事件
+                                let output_tokens = ctx.output_tokens();
+                                let cache_result = ctx.cache_result();
                                 let all_events = ctx.finish_and_get_all_events();
+                                log_ctx.record(
+                                    "stream_error",
+                                    Some(credential_id),
+                                    Some(output_tokens),
+                                    cache_result,
+                                    None,
+                                    Some(error),
+                                );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, log_ctx, credential_id)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                let output_tokens = ctx.output_tokens();
+                                let cache_result = ctx.cache_result();
                                 let all_events = ctx.finish_and_get_all_events();
+                                log_ctx.record(
+                                    "ok",
+                                    Some(credential_id),
+                                    Some(output_tokens),
+                                    cache_result,
+                                    None,
+                                    None,
+                                );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, log_ctx, credential_id)));
                             }
                         }
                     }

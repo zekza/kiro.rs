@@ -19,11 +19,29 @@
 
 ## 当前集成优先级
 
-1. Prompt cache usage 模拟：优先参考 `easayliu`，当前集成分支已开始移植轻量适配版。
-2. 限流冷却和用户亲和：优先参考 `BenedictKing`，后续小步接入 `token_manager`。
-3. 调用记录：第一阶段参考 `luluxiuxiu` 的轻量 JSON 统计，第二阶段再评估 `gitmzc` 的 SQLite 请求流水。
-4. OpenAI 兼容：参考 `siyuan-123`，建议单独分支/批次移植。
-5. `hcscq` 的 token bucket/并发/Redis 共享态能力强，但不适合和第一批功能混合落地。
+1. Prompt cache usage 模拟：参考 `easayliu` / `BenedictKing`，当前集成分支已接入轻量版。
+2. 限流冷却和用户亲和：参考 `BenedictKing` / `easayliu`，当前集成分支已接入短冷却、成功恢复、conversation 亲和。
+3. 调用记录：参考 `luluxiuxiu` 的轻量统计方向，当前集成分支已先接入 JSONL 调用记录；暂不引入 SQLite 请求流水。
+4. 上游错误安全映射和大体量日志截断：参考 `hcscq` / `Cen-Yaozu`，当前集成分支已接入安全错误映射、UTF-8 安全截断、上游错误体截断。
+5. OpenAI 兼容：参考 `siyuan-123`，建议单独分支/批次移植。
+6. `hcscq` 的 token bucket/并发/Redis 共享态能力强，但不适合和第一批功能混合落地。
+
+## 已接入功能
+
+- Prompt cache usage 模拟：写入 Anthropic/NewAPI 兼容的 `cache_read_input_tokens`、`cache_creation_input_tokens` 和 `cache_creation.ephemeral_*` usage 字段。
+- 凭据冷却与亲和：429/408/5xx 设置临时冷却，成功后清理冷却；同一 conversation 尽量绑定同一凭据，减少 cache 反复预热。
+- 轻量调用记录：新增 JSONL 调用记录，记录模型、stream、凭据 ID、耗时、输入/输出 tokens、cache usage、状态、脱敏截断后的请求/响应/错误体。
+- UTF-8 安全截断：用于日志和调用记录，避免按字节截断中文/多字节字符导致 panic 或乱码。
+- 上游错误映射：对 context 过长、输入过长、限流、无可用凭据、400 malformed 做更明确的 HTTP 映射；详细上游错误只写本地日志，不直接透传给客户端。
+
+## 暂缓/待决策功能
+
+- `gitmzc` SQLite 请求流水、前端日志流、管理端重构：可观测性强，但会引入数据库 schema、管理端 API 和前端大改，建议后续单独批次。
+- `hcscq` token bucket、并发队列、Redis 共享运行态、模型策略：功能强，但会显著改变调度和请求分布，存在风控与回归风险，需单独评审默认值。
+- `siyuan-123` OpenAI Chat/Responses 兼容：价值明确，但接口面大，建议独立分支移植和压测。
+- `coderdkai` SQLite 持久化、Device Flow、自动注册、web session 导出：产品化价值高，但凭据/登录面风险高，需你确认后再做。
+- `BaSui01` API key 管理、池级路由、CSRF、历史管理：管理端改动大，和当前目标不是同一批次。
+- `Theo-jobs` Redis 缓存热更新、企业 OIDC、全局/凭据代理：适合部署增强批次，不混入当前主链路。
 
 ## 风险记录
 

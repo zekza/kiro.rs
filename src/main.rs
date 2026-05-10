@@ -134,7 +134,7 @@ async fn main() {
         config.clone(),
         credentials_list,
         proxy_config.clone(),
-        Some(credentials_path.into()),
+        Some(credentials_path.clone().into()),
         is_multiple_format,
     )
     .unwrap_or_else(|e| {
@@ -168,12 +168,29 @@ async fn main() {
     } else {
         None
     };
+    let call_logger = if config.call_logging_enabled {
+        let log_path = config
+            .call_log_path
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                anthropic::call_log::default_log_path(Some(credentials_path.clone().into()))
+            });
+        tracing::info!("调用记录已启用: {}", log_path.display());
+        Some(Arc::new(anthropic::call_log::CallLogger::new(
+            log_path,
+            config.call_log_body_bytes,
+        )))
+    } else {
+        None
+    };
 
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
         cache_tracker,
+        call_logger,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

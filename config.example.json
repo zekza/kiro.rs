@@ -9,5 +9,8 @@
   "promptCacheTtlSeconds": 3600,
   "cacheScope": "global",
   "cacheSkipRate": null,
+  "callLoggingEnabled": true,
+  "callLogPath": null,
+  "callLogBodyBytes": 4096,
   "defaultEndpoint": "ide"
 }
