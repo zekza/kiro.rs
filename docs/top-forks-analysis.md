@@ -26,6 +26,20 @@
 5. OpenAI 兼容：参考 `siyuan-123`，建议单独分支/批次移植。
 6. `hcscq` 的 token bucket/并发/Redis 共享态能力强，但不适合和第一批功能混合落地。
 
+## 重复功能方案对比
+
+| 功能主题 | 候选实现 | 方案评估 | 当前决策 |
+|---|---|---|---|
+| Prompt cache usage 模拟 | `easayliu`、`BenedictKing` | `easayliu` 的实现更贴近 Claude Code 真实请求形态：按 `metadata.user_id` 分桶、剥离 billing header、20 段回扫、5m/1h TTL 分桶和 cache skip rate 都更完整；`BenedictKing` 覆盖面广，测试多，但部分实现较早期，lookback 默认更保守。 | 采用混合方案：以 `easayliu` 的 cache tracker 规则为主，吸收 `BenedictKing` 的 usage 注入覆盖面。当前分支已接入核心规则。 |
+| 凭据冷却/限流恢复 | `BenedictKing`、`easayliu`、`hcscq` | `BenedictKing` 的全凭据冷却快速返回和 `Retry-After` 语义最好；`easayliu` 的退避节奏简单；`hcscq` 的 token bucket/队列/并发策略最强，但会显著改变请求分布。 | 当前先采用轻量冷却：429/408/5xx 临时冷却、成功恢复、全部冷却时快速失败。后续优先补 `Retry-After`，暂缓 token bucket/队列。 |
+| 账号亲和/粘滞 | `BenedictKing`、`easayliu`、`gitmzc` | `BenedictKing`/`easayliu` 使用和 cache identity 相关的 binding key，能减少跨账号反复预热；`gitmzc` 的 session 粘滞与统计系统耦合更重。 | 采用轻量 conversation affinity，不引入完整 session 存储。后续如做 SQLite 统计，再评估 session 级持久粘滞。 |
+| 调用记录/统计 | `luluxiuxiu`、`gitmzc`、`BenedictKing` | `luluxiuxiu` 的轻量统计方向适合第一批；`gitmzc` 的 SQLite 请求流水和前端日志流可观测性更强但改动大；`BenedictKing` 的 sensitive logs/截断思路更重视隐私边界。 | 当前采用 JSONL 轻量记录，并做脱敏和 UTF-8 安全截断。后续应补“默认关闭或显式 sensitive logging 开关”的策略，再考虑 SQLite。 |
+| 上游错误映射 | `hcscq`、`BenedictKing`、`Cen-Yaozu` | `hcscq` 的 `PublicProviderError` 类型化错误最好，能避免字符串匹配脆弱；`BenedictKing` 的 400 诊断和大 body 截断也有价值；`Cen-Yaozu` 偏友好提示和 token 诊断。 | 当前先用保守字符串映射和安全截断。后续建议独立小补丁引入 typed provider error，再替换字符串匹配。 |
+| Stream 稳定性/重试 | `hcscq`、`luluxiuxiu`、`gitmzc` | `hcscq` 的“发送 SSE 前 bounded retry”风险较低；`luluxiuxiu` 的 stream interruption retry 和 history truncation 功能强，但可能改变 Claude Code 工具调用连续性；`gitmzc` 的 `/cc/v1` 缓冲流更偏协议兼容。 | 暂缓。Claude Code 已经出现过中断问题，stream retry/history truncation 需要真实压测后单独接入。 |
+| 真响应缓存 response replay | `Jarvisu88` 非 top10 fork，提交 `802eacd` 后又被 `c9c7270` revert | 方案有价值：只缓存完全相同的非流式请求、跳过 stream 和 WebSearch、TTL 文件缓存、命中跳过上游。但它后来被作者撤回，且缓存完整响应可能重放旧 tool_use/id/usage，对 Claude Code 长会话和工具链有中等风险。 | 暂不接入主链路。若要做，只能 opt-in、默认关闭、限制非 stream/无 tool_use/无 WebSearch，并给命中响应重新生成 message id 与 usage 标记。 |
+| OpenAI 兼容 | `siyuan-123` | Chat/Responses 兼容价值明确，但接口面大，容易和 Anthropic/Claude Code 主路径互相影响。 | 独立分支移植，不和当前 Claude Code 稳定性修复混合。 |
+| 管理端/持久化/登录 | `gitmzc`、`BaSui01`、`coderdkai`、`Theo-jobs` | SQLite、Redis、Device Flow、自动注册、API key 池、OIDC 都是产品化能力，但凭据面和部署面风险更高。 | 排后，等核心反代链路稳定后逐项决策。 |
+
 ## 已接入功能
 
 - Prompt cache usage 模拟：写入 Anthropic/NewAPI 兼容的 `cache_read_input_tokens`、`cache_creation_input_tokens` 和 `cache_creation.ephemeral_*` usage 字段。
@@ -42,9 +56,10 @@
 - `coderdkai` SQLite 持久化、Device Flow、自动注册、web session 导出：产品化价值高，但凭据/登录面风险高，需你确认后再做。
 - `BaSui01` API key 管理、池级路由、CSRF、历史管理：管理端改动大，和当前目标不是同一批次。
 - `Theo-jobs` Redis 缓存热更新、企业 OIDC、全局/凭据代理：适合部署增强批次，不混入当前主链路。
+- `Jarvisu88` response replay cache：功能正好对应“真缓存”，但该 fork 已 revert；若后续接入，需要重新设计默认值、命中标记和 tool_use 排除规则。
 
 ## 风险记录
 
-- 这些 fork 里未发现完整“真实响应缓存/response replay cache”。目前看到的是 prompt cache usage 模拟，不会跳过上游调用。
+- Top10 fork 里未发现成熟的“真实响应缓存/response replay cache”。`Jarvisu88` 曾实现 opt-in 非流式响应缓存，但随后 revert，当前只作为参考方案。
 - 自动冷却、账号轮换、亲和路由会改变请求分布，可能影响上游风控，需要保守默认值。
 - 大规模管理端、SQLite、Redis、OpenAI 兼容都应分批移植，避免一次性冲突和回归。
