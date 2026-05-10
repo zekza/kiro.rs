@@ -1,0 +1,89 @@
+name: Zekza Integrate Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image/artifact tag"
+        required: true
+        default: "integrate-top-forks"
+  push:
+    branches:
+      - integrate-top-forks
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="integrate-top-forks-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/kiro-rs:integrate-top-forks
+
+  binary:
+    name: Linux binary
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Build admin UI
+        working-directory: admin-ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build binary
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiro-rs-linux-x64
+          path: target/release/kiro-rs
