@@ -317,7 +317,6 @@ impl CacheTracker {
         let uncached = profile
             .total_input_tokens
             .saturating_sub(cache_read)
-            .saturating_sub(cache_creation)
             .max(0);
 
         CacheResult {
@@ -739,6 +738,7 @@ mod tests {
         let first = tracker.compute_and_update(1, &profile1);
         assert_eq!(first.cache_read_input_tokens, 0);
         assert!(first.cache_creation_input_tokens > 0);
+        assert_eq!(first.uncached_input_tokens, 5000);
 
         let profile2 = tracker.build_profile(&req, 5000);
         let second = tracker.compute_and_update(1, &profile2);
@@ -747,5 +747,9 @@ mod tests {
             first.cache_creation_input_tokens
         );
         assert_eq!(second.cache_creation_input_tokens, 0);
+        assert_eq!(
+            second.uncached_input_tokens,
+            5000 - second.cache_read_input_tokens
+        );
     }
 }
