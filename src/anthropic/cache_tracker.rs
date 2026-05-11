@@ -653,6 +653,8 @@ fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
         || m.contains("opus-4.5")
         || m.contains("opus-4-6")
         || m.contains("opus-4.6")
+        || m.contains("opus-4-7")
+        || m.contains("opus-4.7")
         || m.contains("haiku-4-5")
         || m.contains("haiku-4.5")
     {
