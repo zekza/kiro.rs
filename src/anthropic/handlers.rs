@@ -124,7 +124,7 @@ fn compute_cache_result(
 }
 
 fn usage_input_tokens(estimated_input_tokens: i32, cache_result: CacheResult) -> i32 {
-    if cache_result.cache_read_input_tokens > 0 || cache_result.cache_creation_input_tokens > 0 {
+    if cache_result.cache_read_input_tokens > 0 {
         cache_result.uncached_input_tokens.max(0)
     } else {
         estimated_input_tokens
@@ -137,9 +137,8 @@ fn usage_input_tokens_from_context(
     cache_result: CacheResult,
 ) -> i32 {
     let base = context_input_tokens.unwrap_or(estimated_input_tokens);
-    if cache_result.cache_read_input_tokens > 0 || cache_result.cache_creation_input_tokens > 0 {
+    if cache_result.cache_read_input_tokens > 0 {
         base.saturating_sub(cache_result.cache_read_input_tokens)
-            .saturating_sub(cache_result.cache_creation_input_tokens)
             .max(0)
     } else {
         base
@@ -1260,4 +1259,35 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_usage_input_tokens_keeps_cache_creation_billable() {
+        let cache = CacheResult {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            uncached_input_tokens: 5000,
+            ..Default::default()
+        };
+
+        assert_eq!(usage_input_tokens(5000, cache), 5000);
+        assert_eq!(usage_input_tokens_from_context(Some(5200), 5000, cache), 5200);
+    }
+
+    #[test]
+    fn test_usage_input_tokens_subtracts_cache_read_only() {
+        let cache = CacheResult {
+            cache_read_input_tokens: 4000,
+            cache_creation_input_tokens: 1000,
+            uncached_input_tokens: 2000,
+            ..Default::default()
+        };
+
+        assert_eq!(usage_input_tokens(6000, cache), 2000);
+        assert_eq!(usage_input_tokens_from_context(Some(6500), 6000, cache), 2500);
+    }
 }

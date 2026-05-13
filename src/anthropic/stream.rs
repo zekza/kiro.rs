@@ -248,7 +248,7 @@ fn usage_json(input_tokens: i32, output_tokens: i32, cache: CacheResult) -> serd
 }
 
 fn effective_input_tokens(input_tokens: i32, cache: CacheResult) -> i32 {
-    if cache.cache_read_input_tokens > 0 || cache.cache_creation_input_tokens > 0 {
+    if cache.cache_read_input_tokens > 0 {
         cache.uncached_input_tokens.max(0)
     } else {
         input_tokens
@@ -1290,6 +1290,30 @@ fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_effective_input_tokens_keeps_cache_creation_billable() {
+        let cache = CacheResult {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            uncached_input_tokens: 5000,
+            ..Default::default()
+        };
+
+        assert_eq!(effective_input_tokens(5000, cache), 5000);
+    }
+
+    #[test]
+    fn test_effective_input_tokens_subtracts_cache_read_only() {
+        let cache = CacheResult {
+            cache_read_input_tokens: 4000,
+            cache_creation_input_tokens: 1000,
+            uncached_input_tokens: 2000,
+            ..Default::default()
+        };
+
+        assert_eq!(effective_input_tokens(6000, cache), 2000);
+    }
 
     #[test]
     fn test_sse_event_format() {
