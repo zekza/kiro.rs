@@ -8,6 +8,7 @@
 /test.json
 /admin-ui/node_modules/
 /admin-ui/dist/
+/admin-ui/.pnpm-store/
 /admin-ui/tsconfig.tsbuildinfo
 /admin-ui/package-lock.json
 /credentials.*
